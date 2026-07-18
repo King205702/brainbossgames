@@ -456,6 +456,13 @@ def get_unclaimed_winning_code(user_id: str):
     return None
 
 
+async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await update.message.reply_text(
+        f"Your Telegram ID (as seen by this bot): {user.id}"
+    )
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎟️ Buy Game Ticket", callback_data="buy_ticket")],
@@ -606,6 +613,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Double-check the number and try again."
             ),
         }
+
+        # Admins get the real internal reason + raw OCR text so screenshots
+        # can be debugged instantly from Telegram, without digging through
+        # Render's logs each time.
+        if user.id in ADMIN_USER_IDS:
+            snippet = parsed_text.strip()[:800] or "(OCR returned empty text)"
+            await message.reply_text(
+                f"[DEBUG — admin only]\nreason: {reason}\namount_tier: {amount_tier}\n\n"
+                f"Raw OCR text:\n{snippet}"
+            )
+            return
+
         await message.reply_text(
             REASON_MESSAGES.get(
                 reason,
@@ -726,6 +745,7 @@ async def newround_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_telegram_app() -> Application:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(CommandHandler("newround", newround_command))
     application.add_handler(CallbackQueryHandler(handle_menu_callback))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))

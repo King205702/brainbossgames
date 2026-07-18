@@ -310,10 +310,11 @@ HALF_AMOUNT_PATTERN = re.compile(
 )
 
 # Different providers word a completed transfer differently. This list is
-# a starting point — MTN, Telecel, and AirtelTigo all phrase this
-# differently, so widen it as you see more real receipts.
+# based on real screenshots tested — MTN and AirtelTigo may still phrase
+# things differently, so widen it further as you see more real receipts.
 SUCCESS_PATTERN = re.compile(
-    r"\b(success(?:ful)?|completed|you\s+have\s+sent|payment\s+received|transaction\s+successful)\b",
+    r"\b(success(?:ful)?|completed|confirmed|you\s+have\s+sent|you\s+have\s+received|"
+    r"payment\s+received|transaction\s+successful)\b",
     re.IGNORECASE,
 )
 

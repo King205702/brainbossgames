@@ -589,11 +589,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         parsed_text = ocr_image(image_bytes)
-    except Exception:
+    except Exception as exc:
         logger.exception("OCR request failed")
-        await message.reply_text(
-            "Payment screenshot not recognized. Please make sure the amount is 5 GHS and try again."
-        )
+        if user.id in ADMIN_USER_IDS:
+            await message.reply_text(f"[DEBUG — admin only] OCR request failed:\n{exc}")
+        else:
+            await message.reply_text(
+                "Payment screenshot not recognized. Please make sure the amount is 5 GHS and try again."
+            )
         return
 
     is_valid, txn_id, reason, amount_tier = validate_receipt_text(parsed_text)

@@ -25,17 +25,21 @@ Environment variables (set these in Render's dashboard, or a local .env):
 
 import os
 import re
+import io
+import json
+import time
 import random
 import sqlite3
 import logging
 import threading
 import contextlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from gtts import gTTS
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -75,6 +79,9 @@ ADMIN_USER_IDS = {
 # The bot must be added as an ADMIN of that channel to post there.
 ANNOUNCEMENT_CHANNEL_ID = os.environ.get("ANNOUNCEMENT_CHANNEL_ID", "").strip() or None
 
+# Your bot's @username (no @), used to build t.me deep links for referrals.
+TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "").strip()
+
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is required.")
 if not SECRET_KEY:
@@ -85,7 +92,16 @@ if not SECRET_KEY:
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brain_boss.db")
 PLAY_TOKEN_MAX_AGE_SECONDS = 10 * 60  # play_token expires 10 minutes after verify-code
-WINNING_FORMULA = "5+4=9"
+ENTRY_FEE_GHS = 5
+
+# Reserved codes for YOU to test the game for free, any time, without paying
+# or going through the bot. They never touch the payments database, never
+# count toward round-winning or the jackpot, and are excluded from the pool
+# of codes randomly generated for real players. Override via env var if
+# you'd rather pick your own.
+TEST_ACCESS_CODES = set(
+    (os.environ.get("TEST_ACCESS_CODES", "") or "900001,900002,900003,900004,900005").split(",")
+)
 
 serializer = URLSafeTimedSerializer(SECRET_KEY, salt="brain-boss-play-token")
 
@@ -152,7 +168,11 @@ def init_db():
                 play_token TEXT,
                 telegram_user_id TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
-                burned_at TEXT
+                burned_at TEXT,
+                module TEXT,                            -- puzzle module assigned to this code
+                puzzle_json TEXT,                        -- safe (answer-free) puzzle data sent to the client
+                correct_answer TEXT,                     -- never sent to the client
+                puzzle_generated_at TEXT
             )
             """
         )
@@ -207,17 +227,61 @@ def init_db():
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payment_references (
+                reference TEXT PRIMARY KEY,               -- e.g. "BB4821"
+                telegram_user_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'unused',     -- 'unused' | 'used'
+                created_at TEXT DEFAULT (datetime('now')),
+                used_at TEXT
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS referral_codes (
+                telegram_user_id TEXT PRIMARY KEY,
+                referral_code TEXT UNIQUE NOT NULL,        -- e.g. "REF4821"
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS referral_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referral_code TEXT NOT NULL,
+                referred_user_id TEXT UNIQUE NOT NULL,     -- a user can only ever be referred once
+                status TEXT NOT NULL DEFAULT 'pending',    -- 'pending' | 'completed'
+                created_at TEXT DEFAULT (datetime('now')),
+                completed_at TEXT
+            )
+            """
+        )
+
         # Migration for DBs created before paid_at existed on withdrawals.
         try:
             conn.execute("ALTER TABLE withdrawals ADD COLUMN paid_at TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
+
+        # Migration for DBs created before server-side puzzle state existed.
+        for column in ["module", "puzzle_json", "correct_answer", "puzzle_generated_at"]:
+            try:
+                conn.execute(f"ALTER TABLE codes ADD COLUMN {column} TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
     logger.info("Database ready at %s", DB_PATH)
 
 
 def generate_unique_code(conn) -> str:
     for _ in range(50):
         candidate = f"{random.randint(0, 999999):06d}"
+        if candidate in TEST_ACCESS_CODES:
+            continue
         row = conn.execute("SELECT 1 FROM codes WHERE code = ?", (candidate,)).fetchone()
         if not row:
             return candidate
@@ -232,6 +296,69 @@ def generate_discount_code(conn) -> str:
         if not row:
             return candidate
     raise RuntimeError("Could not generate a unique discount code after 50 attempts.")
+
+
+def generate_reference_code(conn) -> str:
+    """
+    Short, all-numeric-suffix reference a player types into the MoMo
+    'Reference'/'Note' field when paying. Digits-only suffix maximizes OCR
+    reliability when we read it back off the receipt.
+    """
+    for _ in range(50):
+        candidate = "BB" + f"{random.randint(0, 9999):04d}"
+        row = conn.execute("SELECT 1 FROM payment_references WHERE reference = ?", (candidate,)).fetchone()
+        if not row:
+            return candidate
+    raise RuntimeError("Could not generate a unique reference code after 50 attempts.")
+
+
+def get_or_create_reference(conn, telegram_user_id: str) -> str:
+    """Reuses an existing unused reference for this user if they have one
+    (e.g. they tapped Buy Game Ticket twice), otherwise issues a new one."""
+    row = conn.execute(
+        "SELECT reference FROM payment_references WHERE telegram_user_id = ? AND status = 'unused' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (telegram_user_id,),
+    ).fetchone()
+    if row:
+        return row["reference"]
+
+    reference = generate_reference_code(conn)
+    conn.execute(
+        "INSERT INTO payment_references (reference, telegram_user_id, status) VALUES (?, ?, 'unused')",
+        (reference, telegram_user_id),
+    )
+    return reference
+
+
+def generate_referral_code(conn) -> str:
+    for _ in range(50):
+        candidate = "REF" + f"{random.randint(0, 9999):04d}"
+        row = conn.execute("SELECT 1 FROM referral_codes WHERE referral_code = ?", (candidate,)).fetchone()
+        if not row:
+            return candidate
+    raise RuntimeError("Could not generate a unique referral code after 50 attempts.")
+
+
+def get_or_create_referral_code(conn, telegram_user_id: str) -> str:
+    row = conn.execute(
+        "SELECT referral_code FROM referral_codes WHERE telegram_user_id = ?", (telegram_user_id,)
+    ).fetchone()
+    if row:
+        return row["referral_code"]
+
+    referral_code = generate_referral_code(conn)
+    conn.execute(
+        "INSERT INTO referral_codes (telegram_user_id, referral_code) VALUES (?, ?)",
+        (telegram_user_id, referral_code),
+    )
+    return referral_code
+
+
+def build_referral_link(referral_code: str) -> str:
+    if not TELEGRAM_BOT_USERNAME:
+        return "(set TELEGRAM_BOT_USERNAME to enable referral links)"
+    return f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={referral_code}"
 
 
 # -----------------------------------------------------------------------
@@ -339,28 +466,48 @@ TXN_ID_PATTERNS = [
     re.compile(r"\b(\d{10,20})\b"),
 ]
 
+# Our own player-specific reference codes (e.g. "BB4821"), which we ask
+# players to put in the MoMo "Reference"/"Note" field when paying. If one
+# is found on the receipt, it's a much stronger signal than fuzzy name/number
+# matching — so it's checked (against the DB, by the caller) instead of the
+# recipient check, not in addition to it. Tolerant of OCR/typing variations
+# like "BB 4821" or "BB-4821".
+REFERENCE_PATTERN = re.compile(r"\bBB[\s\-]?(\d{4})\b", re.IGNORECASE)
+
 
 def validate_receipt_text(text: str):
     """
-    Returns (is_valid: bool, transaction_id: str | None, reason: str, amount_tier: str | None)
+    Returns (is_valid, transaction_id, reason, amount_tier, reference_code)
     amount_tier is "full" (5 GHS) or "half" (2.50 GHS, requires a discount code
     to be honored — checked separately by the caller).
+    reference_code is a "BBxxxx" string if found on the receipt, else None —
+    the caller is responsible for verifying it against the database.
     """
     if PENDING_PATTERN.search(text):
-        return False, None, "Transaction appears pending, not completed.", None
+        return False, None, "Transaction appears pending, not completed.", None, None
 
     if not SUCCESS_PATTERN.search(text):
-        return False, None, "No success confirmation found on the receipt.", None
+        return False, None, "No success confirmation found on the receipt.", None, None
 
     if FULL_AMOUNT_PATTERN.search(text):
         amount_tier = "full"
     elif HALF_AMOUNT_PATTERN.search(text):
         amount_tier = "half"
     else:
-        return False, None, "Could not confirm the payment amount (5 GHS, or 2.50 GHS with a discount code).", None
+        return (
+            False, None,
+            "Could not confirm the payment amount (5 GHS, or 2.50 GHS with a discount code).",
+            None, None,
+        )
 
-    if not check_recipient(text):
-        return False, None, "Payment was not sent to the correct recipient.", None
+    ref_match = REFERENCE_PATTERN.search(text)
+    reference_code = f"BB{ref_match.group(1)}" if ref_match else None
+
+    # Only fall back to fuzzy recipient matching if no reference code was
+    # found at all — a found reference code gets verified against the DB
+    # by the caller instead, which is a much more reliable signal.
+    if not reference_code and not check_recipient(text):
+        return False, None, "Payment was not sent to the correct recipient.", None, None
 
     txn_id = None
     for pattern in TXN_ID_PATTERNS:
@@ -370,9 +517,132 @@ def validate_receipt_text(text: str):
             break
 
     if not txn_id:
-        return False, None, "Could not find a transaction ID on the receipt.", None
+        return False, None, "Could not find a transaction ID on the receipt.", None, None
 
-    return True, txn_id, "ok", amount_tier
+    return True, txn_id, "ok", amount_tier, reference_code
+
+
+# -----------------------------------------------------------------------
+# VAULT ESCAPE — server-authoritative puzzle generation & answer checking
+#
+# The browser NEVER decides whether a puzzle was solved correctly. It only
+# renders whatever puzzle_json this module hands it, and reports back the
+# player's raw answer (which button they tapped, what they typed). Every
+# puzzle instance and its correct answer is generated here and stored
+# server-side (in the `codes` row for real games, or signed into the
+# play_token for test games) before the client ever sees it.
+# -----------------------------------------------------------------------
+
+MODULE_NAMES = ["sequence_trap", "detective", "spot_glitch", "audio_cipher"]
+
+
+def generate_sequence_trap():
+    use_multiply = random.random() < 0.5
+    k = random.randint(2, 3) if use_multiply else random.randint(3, 8)
+    start = random.randint(1, 6)
+    terms = [start]
+    for _ in range(3):
+        start = start * k if use_multiply else start + k
+        terms.append(start)
+
+    correct = terms[3] * k if use_multiply else terms[3] + k
+    # The trap: the answer you'd get by mistaking the rule for the OTHER
+    # operation — the "90% get it wrong" answer.
+    trap = terms[3] + k if use_multiply else terms[3] * k
+    distractor = correct + random.choice([-1, 1]) * random.randint(1, 3)
+
+    options = list(dict.fromkeys([correct, trap, distractor, correct + k]))
+    while len(options) < 4:
+        candidate = correct + random.randint(-10, 10)
+        if candidate not in options:
+            options.append(candidate)
+    options = options[:4]
+    random.shuffle(options)
+
+    return {"terms": terms, "options": options}, str(correct)
+
+
+DETECTIVE_SCENARIOS = [
+    {
+        "brief": "The vault's emergency cash box vanished at 9:14 PM. Only three guards were on that floor.",
+        "suspects": [
+            {"name": "Marcus", "avatar": "🕴️", "alibi": "\"I was reviewing the security footage in the control room the whole time.\"", "guilty": False},
+            {"name": "Priscilla", "avatar": "👩‍💼", "alibi": "\"I was on my dinner break outside — I only came back at 9:20.\"", "guilty": False},
+            {"name": "Derek", "avatar": "🧑‍🔧", "alibi": "\"I was fixing the vault camera wiring — that's why there's no footage from 9:10 to 9:16.\"", "guilty": True},
+        ],
+    },
+    {
+        "brief": "A guest's diamond ring disappeared from suite 4B between 6 and 7 PM. Housekeeping had three staff on that floor.",
+        "suspects": [
+            {"name": "Ama", "avatar": "🧹", "alibi": "\"I cleaned 4B at 5:45, then went straight to 4C — the guest there can confirm.\"", "guilty": False},
+            {"name": "Kwesi", "avatar": "🧑‍🍳", "alibi": "\"I was restocking the minibar in 4B until 6:50 — I left right as the guest returned.\"", "guilty": True},
+            {"name": "Efua", "avatar": "🧺", "alibi": "\"I was on laundry duty in the basement all evening.\"", "guilty": False},
+        ],
+    },
+    {
+        "brief": "Someone tampered with the poker table's shuffler at exactly 11 PM. Three staff had access to the pit.",
+        "suspects": [
+            {"name": "Yaw", "avatar": "🎲", "alibi": "\"I was on my break in the staff room — camera shows me there from 10:50.\"", "guilty": False},
+            {"name": "Naomi", "avatar": "💼", "alibi": "\"I was auditing the cash drawer at the far end of the pit the entire time.\"", "guilty": False},
+            {"name": "Kojo", "avatar": "🃏", "alibi": "\"I was resetting the shuffler for maintenance — but maintenance wasn't scheduled until tomorrow.\"", "guilty": True},
+        ],
+    },
+]
+
+
+def generate_detective():
+    scenario = random.choice(DETECTIVE_SCENARIOS)
+    suspects = [{"name": s["name"], "avatar": s["avatar"], "alibi": s["alibi"]} for s in scenario["suspects"]]
+    guilty = next(s["name"] for s in scenario["suspects"] if s["guilty"])
+    return {"brief": scenario["brief"], "suspects": suspects}, guilty
+
+
+GLITCH_SCENES = [
+    {"theme": "an old market square", "normal": "🏺", "anomaly": "📱"},
+    {"theme": "a medieval camp", "normal": "⚔️", "anomaly": "🔋"},
+    {"theme": "an ancient temple", "normal": "🏛️", "anomaly": "💡"},
+    {"theme": "an 1800s harbor", "normal": "⛵", "anomaly": "🚀"},
+]
+
+
+def generate_spot_glitch():
+    scene = random.choice(GLITCH_SCENES)
+    size = 15
+    anomaly_index = random.randint(0, size - 1)
+    grid = [scene["anomaly"] if i == anomaly_index else scene["normal"] for i in range(size)]
+    return {"theme": scene["theme"], "grid": grid}, str(anomaly_index)
+
+
+CIPHER_WORDS = ["VAULT", "ESCAPE", "SHADOW", "GOLDEN", "CIPHER", "BREACH"]
+
+
+def generate_audio_cipher():
+    word = random.choice(CIPHER_WORDS)
+    # Nothing revealed here — the client fetches synthesized audio for this
+    # word from a separate endpoint that never returns the text itself.
+    return {}, word
+
+
+def generate_puzzle_for_module(module: str):
+    if module == "sequence_trap":
+        return generate_sequence_trap()
+    if module == "detective":
+        return generate_detective()
+    if module == "spot_glitch":
+        return generate_spot_glitch()
+    if module == "audio_cipher":
+        return generate_audio_cipher()
+    raise ValueError(f"Unknown module: {module}")
+
+
+def check_answer(module: str, correct_answer: str, submitted_answer: str) -> bool:
+    submitted = str(submitted_answer or "").strip()
+    correct = str(correct_answer or "").strip()
+    if module == "detective":
+        return submitted.lower() == correct.lower()
+    if module == "audio_cipher":
+        return submitted.upper() == correct.upper()
+    return submitted == correct  # sequence_trap, spot_glitch: exact string match
 
 
 # -----------------------------------------------------------------------
@@ -381,13 +651,15 @@ def validate_receipt_text(text: str):
 
 RECIPIENT_DISPLAY_NAME = " ".join(t.title() for t in RECIPIENT_NAME_TOKENS)
 
-RULES_TEXT = f"""🧠 WELCOME TO BRAIN BOSS ARENA 🏆
+def build_rules_text(reference: str) -> str:
+    return f"""🧠 WELCOME TO BRAIN BOSS ARENA 🏆
 Here are the official rules for today's matchstick challenge:
 
 1️⃣ ENTRY FEE & PAYMENT:
 - The entry fee is exactly 5 GHS.
 - Send payment to: {RECIPIENT_NUMBER} ({RECIPIENT_DISPLAY_NAME}).
-- Upload your clean screenshot receipt here. Our automated system reads MTN, Telecel, and AT networks. (Note: Data bundle or airtime purchase screenshots will be automatically rejected).
+- IMPORTANT: Enter this exact reference in the MoMo "Reference" or "Note" field when you pay: {reference}
+- Upload your clean screenshot receipt here afterward. Our automated system reads MTN, Telecel, and AT networks. (Note: Data bundle or airtime purchase screenshots will be automatically rejected).
 
 2️⃣ THE CHALLENGE WEBSITE:
 - Once verified, you will receive a unique 6-digit access code and the game link.
@@ -403,7 +675,7 @@ Here are the official rules for today's matchstick challenge:
 - If someone else beats you to it, your code is still burned (no refund), but you won't be marked as the winner — even if your answer was also correct.
 - Once someone wins, the round closes. Watch this channel for the payout proof and the announcement of the next round.
 
-Send your payment screenshot now to get your access code and race to be first!"""
+Your payment reference is {reference} — don't forget to include it! Send your screenshot now and race to be first!"""
 
 # Telegram user_ids currently expected to reply with withdrawal details next.
 # Maps user_id -> the winning_code their withdrawal request will reference.
@@ -464,9 +736,33 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    # Deep-link referral capture: t.me/YourBot?start=REF4821 arrives here as
+    # context.args == ["REF4821"]. Only counts once per user, ever, and never
+    # for someone referring themselves.
+    if context.args:
+        referral_code = context.args[0].strip()
+        with db_lock, contextlib.closing(get_conn()) as conn:
+            owner = conn.execute(
+                "SELECT telegram_user_id FROM referral_codes WHERE referral_code = ?", (referral_code,)
+            ).fetchone()
+            already_referred = conn.execute(
+                "SELECT 1 FROM referral_events WHERE referred_user_id = ?", (str(user.id),)
+            ).fetchone()
+
+            if owner and owner["telegram_user_id"] != str(user.id) and not already_referred:
+                with conn:
+                    conn.execute(
+                        "INSERT INTO referral_events (referral_code, referred_user_id, status) "
+                        "VALUES (?, ?, 'pending')",
+                        (referral_code, str(user.id)),
+                    )
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎟️ Buy Game Ticket", callback_data="buy_ticket")],
         [InlineKeyboardButton("💰 Withdraw Winnings", callback_data="withdraw")],
+        [InlineKeyboardButton("📢 My Referrals", callback_data="referrals")],
     ])
     await update.message.reply_text(
         "Welcome to Brain Boss! What would you like to do?",
@@ -480,7 +776,9 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
 
     if query.data == "buy_ticket":
-        await query.message.reply_text(RULES_TEXT)
+        with db_lock, contextlib.closing(get_conn()) as conn, conn:
+            reference = get_or_create_reference(conn, str(user.id))
+        await query.message.reply_text(build_rules_text(reference))
         return
 
     if query.data == "withdraw":
@@ -511,6 +809,30 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             "- Registered Name\n"
             "- Network (MTN / Telecel / AT)\n\n"
             "Send all three in one message."
+        )
+        return
+
+    if query.data == "referrals":
+        with db_lock, contextlib.closing(get_conn()) as conn, conn:
+            referral_code = get_or_create_referral_code(conn, str(user.id))
+            completed_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM referral_events WHERE referral_code = ? AND status = 'completed'",
+                (referral_code,),
+            ).fetchone()["n"]
+
+        link = build_referral_link(referral_code)
+        slots_filled = completed_count % 3
+        progress_bar = "".join("✅" if i < slots_filled else "❌" for i in range(3))
+        share_message = (
+            f"Yo! I'm trapped in this 5 GHS puzzle vault trying to win the mega jackpot. "
+            f"Click my link to join and help me break out! 🔐👇\n{link}"
+        )
+
+        await query.message.reply_text(
+            f"📢 Your referral link:\n{link}\n\n"
+            f"Progress to your next free entry: [{progress_bar}]\n"
+            f"({slots_filled}/3 — every 3 friends who join and pay their entry fee earns you a 50% discount code)\n\n"
+            f"Share this message with friends:\n\n{share_message}"
         )
         return
 
@@ -599,9 +921,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    is_valid, txn_id, reason, amount_tier = validate_receipt_text(parsed_text)
+    is_valid, txn_id, reason, amount_tier, reference_code = validate_receipt_text(parsed_text)
     logger.info(
-        "OCR validation for user %s: valid=%s reason=%s tier=%s", user.id, is_valid, reason, amount_tier
+        "OCR validation for user %s: valid=%s reason=%s tier=%s ref=%s",
+        user.id, is_valid, reason, amount_tier, reference_code,
     )
 
     if not is_valid:
@@ -613,7 +936,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Payment was not sent to the correct recipient.": (
                 f"That payment doesn't appear to be sent to {RECIPIENT_NAME_TOKENS[0].title()} "
                 f"{RECIPIENT_NAME_TOKENS[1].title()} {RECIPIENT_NAME_TOKENS[2].title()} ({RECIPIENT_NUMBER}). "
-                "Double-check the number and try again."
+                "Double-check the number and try again — or better, get a payment reference from "
+                "'Buy Game Ticket' in the menu and include it next time."
             ),
         }
 
@@ -623,7 +947,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user.id in ADMIN_USER_IDS:
             snippet = parsed_text.strip()[:800] or "(OCR returned empty text)"
             await message.reply_text(
-                f"[DEBUG — admin only]\nreason: {reason}\namount_tier: {amount_tier}\n\n"
+                f"[DEBUG — admin only]\nreason: {reason}\namount_tier: {amount_tier}\nreference_code: {reference_code}\n\n"
                 f"Raw OCR text:\n{snippet}"
             )
             return
@@ -638,6 +962,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     discount_row = None
+    reference_row = None
 
     with db_lock, contextlib.closing(get_conn()) as conn:
         existing = conn.execute(
@@ -650,6 +975,25 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Check your earlier messages for it, or make a new payment."
             )
             return
+
+        # A reference code found on the receipt must actually belong to this
+        # user and be unused — otherwise it's not proof of anything.
+        if reference_code:
+            reference_row = conn.execute(
+                "SELECT * FROM payment_references WHERE reference = ?", (reference_code,)
+            ).fetchone()
+
+            if (
+                not reference_row
+                or reference_row["status"] != "unused"
+                or reference_row["telegram_user_id"] != str(user.id)
+            ):
+                await message.reply_text(
+                    f"We found reference {reference_code} on this receipt, but it doesn't match "
+                    "an active reference for your account. Tap 'Buy Game Ticket' in the menu to "
+                    "get a fresh reference, then try again."
+                )
+                return
 
         # A half-price (2.50 GHS) payment only counts if this user actually
         # holds an unused discount code — otherwise it's just an underpayment.
@@ -669,6 +1013,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         with conn:
+            is_first_ever_code = (
+                conn.execute("SELECT COUNT(*) AS n FROM codes WHERE telegram_user_id = ?", (str(user.id),)).fetchone()["n"]
+                == 0
+            )
+
             code = generate_unique_code(conn)
             conn.execute(
                 """
@@ -682,22 +1031,68 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "UPDATE discounts SET status = 'used', used_at = datetime('now') WHERE code = ?",
                     (discount_row["code"],),
                 )
+            if reference_row:
+                conn.execute(
+                    "UPDATE payment_references SET status = 'used', used_at = datetime('now') WHERE reference = ?",
+                    (reference_code,),
+                )
 
+            # Referral completion: only counts on this user's very first
+            # ever paid entry, so someone can't rack up repeat "referrals"
+            # for their own referrer by just paying again.
+            referral_reward_code = None
+            referral_owner_id = None
+            if is_first_ever_code:
+                pending_referral = conn.execute(
+                    "SELECT * FROM referral_events WHERE referred_user_id = ? AND status = 'pending'",
+                    (str(user.id),),
+                ).fetchone()
+                if pending_referral:
+                    conn.execute(
+                        "UPDATE referral_events SET status = 'completed', completed_at = datetime('now') "
+                        "WHERE id = ?",
+                        (pending_referral["id"],),
+                    )
+                    owner_row = conn.execute(
+                        "SELECT telegram_user_id FROM referral_codes WHERE referral_code = ?",
+                        (pending_referral["referral_code"],),
+                    ).fetchone()
+                    if owner_row:
+                        completed_count = conn.execute(
+                            "SELECT COUNT(*) AS n FROM referral_events WHERE referral_code = ? AND status = 'completed'",
+                            (pending_referral["referral_code"],),
+                        ).fetchone()["n"]
+                        if completed_count % 3 == 0:
+                            referral_owner_id = owner_row["telegram_user_id"]
+                            referral_reward_code = generate_discount_code(conn)
+                            conn.execute(
+                                "INSERT INTO discounts (code, telegram_user_id, percent_off, source) "
+                                "VALUES (?, ?, 50, 'referral_bonus')",
+                                (referral_reward_code, referral_owner_id),
+                            )
+
+    if referral_reward_code and referral_owner_id:
+        send_telegram_dm(
+            referral_owner_id,
+            f"🎉 3 friends joined through your referral link! Here's a 50% discount code "
+            f"for your next entry:\n\n{referral_reward_code}\n\n"
+            f"Pay 2.50 GHS instead of 5 GHS, and send the screenshot as usual — "
+            f"we'll recognize the discount automatically.",
+        )
+
+    prefix = ""
     if discount_row:
-        await message.reply_text(
-            f"Discount applied! 🎉 ({discount_row['code']})\n\n"
-            f"Payment confirmed! ✅\n\n"
-            f"Your access code: {code}\n\n"
-            f"Play here: {FRONTEND_URL}\n\n"
-            f"This code works once — save it now."
-        )
-    else:
-        await message.reply_text(
-            f"Payment confirmed! ✅\n\n"
-            f"Your access code: {code}\n\n"
-            f"Play here: {FRONTEND_URL}\n\n"
-            f"This code works once — save it now."
-        )
+        prefix += f"Discount applied! 🎉 ({discount_row['code']})\n\n"
+    if reference_row:
+        prefix += f"Reference {reference_code} matched ✅\n\n"
+
+    await message.reply_text(
+        f"{prefix}"
+        f"Payment confirmed! ✅\n\n"
+        f"Your access code: {code}\n\n"
+        f"Play here: {FRONTEND_URL}\n\n"
+        f"This code works once — save it now."
+    )
 
 
 async def handle_other_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -791,6 +1186,14 @@ def verify_code():
     if not re.fullmatch(r"\d{6}", code):
         return jsonify({"valid": False, "message": "Enter a valid 6-digit code."}), 400
 
+    # Admin test codes: always valid, never touch the payments DB, never
+    # affect round-winning or the jackpot. Everything about the test session
+    # (module + answer) is signed into the token itself since there's no
+    # persistent `codes` row for these.
+    if code in TEST_ACCESS_CODES:
+        play_token = serializer.dumps({"code": code, "test": True})
+        return jsonify({"valid": True, "play_token": play_token, "referral_link": None, "test": True})
+
     with db_lock, contextlib.closing(get_conn()) as conn:
         row = conn.execute("SELECT * FROM codes WHERE code = ?", (code,)).fetchone()
 
@@ -801,6 +1204,7 @@ def verify_code():
             return jsonify({"valid": False, "message": "This code has already been used."}), 410
 
         play_token = serializer.dumps({"code": code})
+        referral_code = get_or_create_referral_code(conn, row["telegram_user_id"]) if row["telegram_user_id"] else None
 
         with conn:
             conn.execute(
@@ -808,7 +1212,118 @@ def verify_code():
                 (play_token, code),
             )
 
-    return jsonify({"valid": True, "play_token": play_token})
+    referral_link = build_referral_link(referral_code) if referral_code else None
+    return jsonify({"valid": True, "play_token": play_token, "referral_link": referral_link})
+
+
+@app.get("/api/jackpot")
+def jackpot():
+    with contextlib.closing(get_conn()) as conn:
+        total_codes = conn.execute("SELECT COUNT(*) AS n FROM codes").fetchone()["n"]
+    return jsonify({"amount": total_codes * ENTRY_FEE_GHS, "currency": "GHS"})
+
+
+@app.post("/api/start-game")
+def start_game():
+    """
+    Generates (or re-serves, if already generated for this session) the
+    puzzle instance the player will see — module type + safe puzzle_json,
+    with the correct answer held server-side only. This is what makes
+    answer-checking tamper-proof: the browser never independently decides
+    what "correct" means.
+    """
+    payload = request.get_json(silent=True) or {}
+    code = str(payload.get("code", "")).strip()
+    play_token = str(payload.get("play_token", "")).strip()
+
+    if not re.fullmatch(r"\d{6}", code) or not play_token:
+        return jsonify({"success": False, "message": "Missing or malformed request."}), 400
+
+    try:
+        token_data = serializer.loads(play_token, max_age=PLAY_TOKEN_MAX_AGE_SECONDS)
+    except (SignatureExpired, BadSignature):
+        return jsonify({"success": False, "message": "Invalid or expired session. Re-enter your code."}), 401
+
+    if token_data.get("code") != code:
+        return jsonify({"success": False, "message": "Token does not match code."}), 401
+
+    is_test = bool(token_data.get("test"))
+
+    if is_test:
+        # No DB row for test sessions — generate fresh each time and sign
+        # the answer into a new token, which the client will use to submit.
+        module = random.choice(MODULE_NAMES)
+        puzzle_json, correct_answer = generate_puzzle_for_module(module)
+        new_token = serializer.dumps({"code": code, "test": True, "module": module, "answer": correct_answer})
+        return jsonify({"success": True, "module": module, "puzzle": puzzle_json, "play_token": new_token})
+
+    with db_lock, contextlib.closing(get_conn()) as conn:
+        row = conn.execute("SELECT * FROM codes WHERE code = ?", (code,)).fetchone()
+
+        if not row:
+            return jsonify({"success": False, "message": "Invalid code."}), 404
+        if row["play_token"] != play_token:
+            return jsonify({"success": False, "message": "This session is no longer valid."}), 401
+        if row["status"] != "valid":
+            return jsonify({"success": False, "message": "This code has already been used."}), 410
+
+        # Idempotent: if a puzzle was already generated for this code (e.g.
+        # the page was refreshed), return the SAME one rather than a fresh
+        # random pick — otherwise someone could "reroll" for an easier puzzle.
+        if row["module"] and row["puzzle_json"]:
+            return jsonify({"success": True, "module": row["module"], "puzzle": json.loads(row["puzzle_json"])})
+
+        module = random.choice(MODULE_NAMES)
+        puzzle_json, correct_answer = generate_puzzle_for_module(module)
+
+        with conn:
+            conn.execute(
+                "UPDATE codes SET module = ?, puzzle_json = ?, correct_answer = ?, "
+                "puzzle_generated_at = datetime('now') WHERE code = ?",
+                (module, json.dumps(puzzle_json), correct_answer, code),
+            )
+
+    return jsonify({"success": True, "module": module, "puzzle": puzzle_json})
+
+
+@app.get("/api/cipher-audio/<code>")
+def cipher_audio(code):
+    """
+    Streams synthesized speech of the audio-cipher's secret word. The word
+    text itself is never sent to the client in any other form — only this
+    audio. Works for both real codes (answer stored in DB) and test codes
+    (answer signed into the token, passed as a query param since this is a
+    simple GET request).
+    """
+    code = str(code).strip()
+
+    if code in TEST_ACCESS_CODES:
+        token = request.args.get("play_token", "")
+        try:
+            token_data = serializer.loads(token, max_age=PLAY_TOKEN_MAX_AGE_SECONDS)
+        except (SignatureExpired, BadSignature):
+            return jsonify({"message": "Invalid session."}), 401
+        if token_data.get("code") != code or token_data.get("module") != "audio_cipher":
+            return jsonify({"message": "No active cipher for this session."}), 400
+        word = token_data.get("answer", "")
+    else:
+        with contextlib.closing(get_conn()) as conn:
+            row = conn.execute("SELECT module, correct_answer FROM codes WHERE code = ?", (code,)).fetchone()
+        if not row or row["module"] != "audio_cipher":
+            return jsonify({"message": "No active cipher for this code."}), 400
+        word = row["correct_answer"]
+
+    if not word:
+        return jsonify({"message": "No cipher word available."}), 400
+
+    try:
+        buffer = io.BytesIO()
+        gTTS(text=word, lang="en", slow=False).write_to_fp(buffer)
+        buffer.seek(0)
+        return Response(buffer.read(), mimetype="audio/mpeg")
+    except Exception:
+        logger.exception("Cipher audio generation failed")
+        return jsonify({"message": "Audio generation failed."}), 500
 
 
 @app.post("/api/submit-answer")
@@ -816,12 +1331,12 @@ def submit_answer():
     payload = request.get_json(silent=True) or {}
     code = str(payload.get("code", "")).strip()
     play_token = str(payload.get("play_token", "")).strip()
-    formula = str(payload.get("formula", "")).strip().replace(" ", "")
+    answer = str(payload.get("answer", "")).strip()
+    time_taken = payload.get("time_taken")
 
     if not re.fullmatch(r"\d{6}", code) or not play_token:
         return jsonify({"success": False, "message": "Missing or malformed request."}), 400
 
-    # 1. Validate the signed token itself (signature + expiry).
     try:
         token_data = serializer.loads(play_token, max_age=PLAY_TOKEN_MAX_AGE_SECONDS)
     except SignatureExpired:
@@ -832,16 +1347,31 @@ def submit_answer():
     if token_data.get("code") != code:
         return jsonify({"success": False, "message": "Token does not match code."}), 401
 
+    is_test = bool(token_data.get("test"))
+
+    # --- Test sessions: check answer, report result, touch nothing else. ---
+    if is_test:
+        module = token_data.get("module", "")
+        correct_answer = token_data.get("answer", "")
+        is_correct = check_answer(module, correct_answer, answer)
+        message = (
+            "🧪 [TEST MODE] Correct! (not counted toward any real round)"
+            if is_correct
+            else "🧪 [TEST MODE] Not correct. (not counted toward any real round)"
+        )
+        return jsonify({"success": True, "correct": is_correct, "won": False, "discount_code": None, "message": message, "test": True})
+
     with db_lock, contextlib.closing(get_conn()) as conn:
         row = conn.execute("SELECT * FROM codes WHERE code = ?", (code,)).fetchone()
 
         if not row:
             return jsonify({"success": False, "message": "Invalid code."}), 404
 
-        # Defense in depth: token must also match what's currently on file
-        # for this code (guards against a stale/regenerated token being replayed).
         if row["play_token"] != play_token:
             return jsonify({"success": False, "message": "This session is no longer valid."}), 401
+
+        if not row["module"] or row["correct_answer"] is None:
+            return jsonify({"success": False, "message": "No active puzzle for this code — call start-game first."}), 400
 
         # Atomic burn: the WHERE status='valid' clause means only one
         # concurrent request can ever succeed here, even under a race.
@@ -855,7 +1385,8 @@ def submit_answer():
         if cursor.rowcount == 0:
             return jsonify({"success": False, "message": "This code has already been used."}), 410
 
-        is_correct = formula == WINNING_FORMULA
+        # The server checks the answer — never trusts a client-reported result.
+        is_correct = check_answer(row["module"], row["correct_answer"], answer)
         won_round = False
         discount_code = None
 
@@ -876,7 +1407,7 @@ def submit_answer():
                 with conn:
                     conn.execute(
                         "INSERT INTO winners (code, formula) VALUES (?, ?)",
-                        (code, formula),
+                        (code, f"module={row['module']} time={time_taken}"),
                     )
             else:
                 # Correct, but beaten to it — an honest, transparent reward:
@@ -892,26 +1423,26 @@ def submit_answer():
                     )
 
     if is_correct and won_round:
-        message = "🏆 Correct — and you're the winner of this round! Check the bot menu to withdraw your winnings."
+        message = "🏆 You escaped the vault — and you're the winner of this round! Check the bot menu to withdraw your winnings."
     elif is_correct and not won_round:
         message = (
-            "Correct — but someone else solved it first this round. "
+            "You escaped the vault — but someone else got there first this round. "
             f"No prize this time, but here's 50% off your next entry: {discount_code}. "
             "Send it with your next payment screenshot to redeem it."
         )
     else:
-        message = "That wasn't the right formula."
+        message = "🔒 TRAPPED IN THE VAULT — that wasn't it."
 
     if won_round:
         send_channel_message(
-            text="🎉 WE HAVE A WINNER! Someone just solved today's Brain Boss matchstick "
-            "riddle first and locked in the prize. Payout proof coming soon — stay tuned!"
+            text="🎉 WE HAVE A WINNER! Someone just broke out of today's Brain Boss vault "
+            "first and locked in the prize. Payout proof coming soon — stay tuned!"
         )
 
     if discount_code and row["telegram_user_id"]:
         send_telegram_dm(
             row["telegram_user_id"],
-            f"Nice work — 5+4=9 was correct! Someone just beat you to it this round, "
+            f"Nice work — you escaped the vault! Someone just beat you to it this round, "
             f"so no prize this time. But here's a 50% discount for your next entry:\n\n"
             f"{discount_code}\n\n"
             f"Pay 2.50 GHS instead of 5 GHS next time and send the screenshot as usual — "
@@ -927,6 +1458,39 @@ def submit_answer():
     })
 
 
+def run_daily_reset_loop():
+    """
+    Background loop: once every 24 hours, automatically reopens the game
+    round (same effect as the admin /newround command) and announces it —
+    a fresh reason to come back each day, with no admin action needed.
+    Reset time defaults to midnight UTC; override with DAILY_RESET_HOUR_UTC.
+    """
+    reset_hour = int(os.environ.get("DAILY_RESET_HOUR_UTC", "0"))
+
+    while True:
+        now = datetime.now(timezone.utc)
+        next_reset = now.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
+        if next_reset <= now:
+            next_reset = next_reset + timedelta(days=1)
+        sleep_seconds = (next_reset - now).total_seconds()
+        logger.info("Daily reset scheduled in %.0f seconds", sleep_seconds)
+        time.sleep(max(sleep_seconds, 1))
+
+        try:
+            with db_lock, contextlib.closing(get_conn()) as conn, conn:
+                conn.execute(
+                    "UPDATE game_round SET status = 'open', winner_code = NULL, "
+                    "opened_at = datetime('now'), closed_at = NULL WHERE id = 1"
+                )
+            send_channel_message(
+                text="🌅 A NEW DAY, A NEW VAULT! Today's round is open — pay your 5 GHS entry "
+                "and race to be the FIRST to escape. Only one winner takes the prize. Good luck!"
+            )
+            logger.info("Daily round reset completed")
+        except Exception:
+            logger.exception("Daily reset failed")
+
+
 # -----------------------------------------------------------------------
 # Entry point
 # -----------------------------------------------------------------------
@@ -936,6 +1500,9 @@ if __name__ == "__main__":
 
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
+
+    reset_thread = threading.Thread(target=run_daily_reset_loop, daemon=True)
+    reset_thread.start()
 
     logger.info("Starting Flask API on port %s", PORT)
     app.run(host="0.0.0.0", port=PORT)
